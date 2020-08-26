@@ -172,10 +172,14 @@ class PTW(n: Int)(implicit edge: TLEdgeOut, p: Parameters) extends CoreModule()(
   val l2_refill = RegNext(false.B)
   io.dpath.perf.l2miss := false
   val (l2_hit, l2_error, l2_pte, l2_tlb_ram) = if (coreParams.nL2TLBEntries == 0) (false.B, false.B, Wire(new PTE), None) else {
-    val code = new ParityCode
+    // TODO: ECC mechanism
+    val nL2TLBSets = 128
     require(isPow2(coreParams.nL2TLBEntries))
-    val idxBits = log2Ceil(coreParams.nL2TLBEntries)
+    require(isPow2(nL2TLBSets))
+    
+    val idxBits = log2Ceil(nL2TLBSets)
     val tagBits = vpnBits - idxBits
+    val (r_tag, r_idx) = Split(r_req.addr, idxBits)
 
     class Entry extends Bundle {
       val tag = UInt(width = tagBits)
@@ -190,52 +194,73 @@ class PTW(n: Int)(implicit edge: TLEdgeOut, p: Parameters) extends CoreModule()(
       override def cloneType = new Entry().asInstanceOf[this.type]
     }
 
+    val entrySize = new Entry().getWidth    
     val (ram, omSRAM) =  DescribedSRAM(
       name = "l2_tlb_ram",
       desc = "L2 TLB",
-      size = coreParams.nL2TLBEntries,
-      data = UInt(width = code.width(new Entry().getWidth))
+      size = nL2TLBSets,
+      data = Vec(coreParams.nL2TLBEntries, UInt(width = entrySize))
     )
 
-    val g = Reg(UInt(width = coreParams.nL2TLBEntries))
-    val valid = RegInit(UInt(0, coreParams.nL2TLBEntries))
-    val (r_tag, r_idx) = Split(r_req.addr, idxBits)
+    val g_array = Reg(Vec(nL2TLBSets, UInt(width = coreParams.nL2TLBEntries)))
+    val valid_array = RegInit(Vec(Seq.fill(nL2TLBSets)(0.U(coreParams.nL2TLBEntries.W))))
+    
+    val rand_repl = new RandomReplacement(coreParams.nL2TLBEntries)
     when (l2_refill && !invalidated) {
+      val waddr = if (coreParams.nL2TLBEntries > 1) Mux(valid_array(r_idx).andR, rand_repl.way, PriorityEncoder(~valid_array(r_idx))) else 0.U
+      val offset = if (coreParams.nL2TLBEntries > 1) Vec(UIntToOH(waddr).toBools) else Vec(true.B)
+      val entry_array = Wire(Vec(coreParams.nL2TLBEntries, UInt(width = entrySize)))
       val entry = Wire(new Entry)
       entry := r_pte
       entry.tag := r_tag
-      ram.write(r_idx, code.encode(entry.asUInt))
 
-      val mask = UIntToOH(r_idx)
-      valid := valid | mask
-      g := Mux(r_pte.g, g | mask, g & ~mask)
-    }
-    when (io.dpath.sfence.valid) {
-      valid :=
-        Mux(io.dpath.sfence.bits.rs1, valid & ~UIntToOH(io.dpath.sfence.bits.addr(idxBits+pgIdxBits-1, pgIdxBits)),
-        Mux(io.dpath.sfence.bits.rs2, valid & g, 0.U))
+      entry_array(waddr) := entry.asUInt
+      ram.write(r_idx, entry_array, offset)
+
+      val mask = UIntToOH(waddr)
+      valid_array(r_idx) := valid_array(r_idx) | mask
+      g_array(r_idx) := Mux(r_pte.g, g_array(r_idx) | mask, g_array(r_idx) & ~mask)
+
     }
 
+    // It is hard to flush an entry from the SyncReadMem when
+    // we have a set-associative organization. For now either
+    // flush the selected set or the whole TLB. 
+    when (io.dpath.sfence.valid) { 
+      val fence_addr_idx = (io.dpath.sfence.bits.addr >> pgIdxBits).extract(idxBits-1, 0)
+      when (io.dpath.sfence.bits.rs1) {  
+        valid_array(fence_addr_idx) := 0.U // TODO: Temporary solution
+      } .otherwise { // TODO: Temporary solution
+          for (i <- 0 until nL2TLBSets) {
+             valid_array(i) := 0.U
+          }
+      }
+    }
+
+    val s0_lookup_idx = arb.io.out.bits.bits.addr.extract(idxBits-1, 0)
     val s0_valid = !l2_refill && arb.io.out.fire()
     val s1_valid = RegNext(s0_valid && arb.io.out.bits.valid)
     val s2_valid = RegNext(s1_valid)
-    val s1_rdata = ram.read(arb.io.out.bits.bits.addr(idxBits-1, 0), s0_valid)
-    val s2_rdata = code.decode(RegEnable(s1_rdata, s1_valid))
-    val s2_valid_bit = RegEnable(valid(r_idx), s1_valid)
-    val s2_g = RegEnable(g(r_idx), s1_valid)
-    when (s2_valid && s2_valid_bit && s2_rdata.error) { valid := 0.U }
+    val s1_rdata = ram.read(s0_lookup_idx, s0_valid) 
+    val s2_rdata = RegEnable(s1_rdata, s1_valid)
 
-    val s2_entry = s2_rdata.uncorrected.asTypeOf(new Entry)
-    val s2_hit = s2_valid && s2_valid_bit && r_tag === s2_entry.tag
-    io.dpath.perf.l2miss := s2_valid && !(s2_valid_bit && r_tag === s2_entry.tag)
+    val s2_valid_lookup = RegEnable(valid_array(r_idx), s1_valid)
+    val s2_g_lookup = RegEnable(g_array(r_idx), s1_valid)
+
+    val s2_set = s2_rdata.map(_.asTypeOf(new Entry))
+    val hit_vec = s2_set.map(_.tag === r_tag).asUInt & s2_valid_lookup
+    
+    val s2_hit = s2_valid && hit_vec.orR
+    io.dpath.perf.l2miss := s2_valid && !hit_vec.orR 
+    when (s2_valid && !hit_vec.orR) { rand_repl.miss}
+
     val s2_pte = Wire(new PTE)
-    s2_pte := s2_entry
-    s2_pte.g := s2_g
+    s2_pte := s2_set(OHToUInt(hit_vec))
+    s2_pte.g := s2_g_lookup(OHToUInt(hit_vec))
     s2_pte.v := true
 
     ccover(s2_hit, "L2_TLB_HIT", "L2 TLB hit")
-
-    (s2_hit, s2_rdata.error, s2_pte, Some(ram))
+    (s2_hit, false.B, s2_pte, Some(ram))
   }
 
   // if SFENCE occurs during walk, don't refill PTE cache or L2 TLB until next walk

@@ -83,3 +83,36 @@ class SeqPLRU(n_sets: Int, n_ways: Int) extends SeqReplacementPolicy {
 
   def way = plru_way
 }
+
+
+class nSetsPseudoLRU(nWays: Int, nSets: Int)
+{
+  private val state_reg = Reg(Vec(nSets, UInt(width = nWays-1)))
+  def access(way: UInt, set: UInt) {
+    if (nWays == 1) state_reg(set)
+    else state_reg(set) := get_next_state(state_reg(set), way)
+  }
+  def get_next_state(state: UInt, way: UInt) = {
+    var next_state = state << 1
+    var idx = UInt(1,1)
+    for (i <- log2Up(nWays)-1 to 0 by -1) {
+      val bit = way(i)
+      next_state = next_state.bitSet(idx, !bit)
+      idx = Cat(idx, bit)
+    }
+    next_state(nWays-1, 1)
+  }
+  def replace(set: UInt) = if (nWays==1) 0.U else {
+    get_replace_way(state_reg(set))
+  }
+
+  def get_replace_way(state: UInt) = {
+    val shifted_state = state << 1
+    var idx = UInt(1,1)
+    for (i <- log2Up(nWays)-1 to 0 by -1) {
+      val in_bounds = Cat(idx, UInt(BigInt(1) << i))(log2Up(nWays)-1, 0) < UInt(nWays)
+      idx = Cat(idx, in_bounds && shifted_state(idx))
+    }
+    idx(log2Up(nWays)-1,0)
+  }
+}
